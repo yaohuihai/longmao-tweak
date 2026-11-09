@@ -5,6 +5,8 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
+#import <objc/runtime.h>
 #import <sys/utsname.h>
 #import <string.h>
 #import <stdlib.h>
@@ -320,6 +322,7 @@ static NSDictionary *lm_call(NSString *path, NSString *token, NSDictionary *extr
     req.timeoutInterval = 25;
     [req setValue:@"text/plain;charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
     [req setValue:@"*/*" forHTTPHeaderField:@"Accept"];
+    [req setValue:@"1" forHTTPHeaderField:@"X-LM-Internal"];   // 插件自身请求，hook 不再回捕
     req.HTTPBody = [b64 dataUsingEncoding:NSUTF8StringEncoding];
 
     __block NSData *respData = nil;
@@ -357,7 +360,227 @@ static NSDictionary *lm_call(NSString *path, NSString *token, NSDictionary *extr
     return [obj isKindOfClass:[NSDictionary class]] ? obj : nil;
 }
 
-#pragma mark - token 获取
+#pragma mark - 登录态抓取（hook App 自身请求/响应）
+
+static NSString *lm_latest_hook_token = nil;
+static NSLock *lm_hook_lock = nil;
+
+static NSString *lm_find_token_in_obj(id obj, int depth) {
+    if (!obj || depth > 5) return nil;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        id t = d[@"token"];
+        if ([t isKindOfClass:[NSString class]] && [(NSString *)t length] >= 20) return t;
+        for (id k in d.allKeys) {
+            NSString *r = lm_find_token_in_obj(d[k], depth + 1);
+            if (r.length) return r;
+        }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)obj) {
+            NSString *r = lm_find_token_in_obj(v, depth + 1);
+            if (r.length) return r;
+        }
+    }
+    return nil;
+}
+
+// base64 → XXTEA → msgpack（也兼容裸密文）；只接受 map 头，避免误解析明文
+static id lm_decode_payload(NSData *raw, const char *key) {
+    if (raw.length < 16) return nil;
+    NSData *cipher = nil;
+    NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+    if (txt.length) {
+        NSString *t = [txt stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length >= 16) cipher = [[NSData alloc] initWithBase64EncodedString:t options:NSDataBase64DecodingIgnoreUnknownCharacters];
+    }
+    if (!cipher || cipher.length < 16) cipher = raw;
+    if (cipher.length < 16 || (cipher.length % 4) != 0) return nil;
+    NSData *plain = lm_decrypt(cipher, key);
+    if (plain.length < 8) return nil;
+    const uint8_t *bytes = plain.bytes;
+    uint8_t head = bytes[0];
+    BOOL isMap = (head >= 0x80 && head <= 0x8f) || head == 0xDE || head == 0xDF;
+    if (!isMap) return nil;
+    uint32_t len = (uint32_t)bytes[plain.length - 4]
+                 | ((uint32_t)bytes[plain.length - 3] << 8)
+                 | ((uint32_t)bytes[plain.length - 2] << 16)
+                 | ((uint32_t)bytes[plain.length - 1] << 24);
+    if (len < 2 || len > plain.length) len = (uint32_t)(plain.length - 4);
+    const uint8_t *p = bytes;
+    return mp_decode(&p, bytes + len);
+}
+
+static void lm_note_hook_token(NSString *token) {
+    if (token.length < 20) return;
+    NSString *norm = lm_norm_token(token);
+    if (norm.length < 20) norm = token;
+    if (!lm_hook_lock) lm_hook_lock = [NSLock new];
+    [lm_hook_lock lock];
+    BOOL changed = ![norm isEqualToString:lm_latest_hook_token];
+    lm_latest_hook_token = [norm copy];
+    [lm_hook_lock unlock];
+    if (changed) {
+        [[NSUserDefaults standardUserDefaults] setObject:norm forKey:@"lm_plus_token"];
+        LM_LOG(@"捕获到 App 登录态：%@… (%lu 字符)", [norm substringToIndex:MIN(10u, norm.length)], (unsigned long)norm.length);
+    }
+}
+
+// 插件自己发出的请求带内部标记，避免回捕
+static BOOL lm_is_internal_request(NSURLRequest *req) {
+    return req.allHTTPHeaderFields[@"X-LM-Internal"] != nil;
+}
+
+static void lm_capture_from_request(NSURLRequest *req) {
+    if (!req || lm_is_internal_request(req)) return;
+    @try {
+        NSData *body = req.HTTPBody;
+        if (body.length < 16) return;
+        NSString *t = lm_find_token_in_obj(lm_decode_payload(body, kEncKey), 0);
+        if (t.length) lm_note_hook_token(t);
+    } @catch (NSException *e) {
+        LM_LOG(@"解析请求失败：%@", e);
+    }
+}
+
+static void lm_capture_from_response(NSData *data) {
+    if (data.length < 16) return;
+    @try {
+        NSString *t = lm_find_token_in_obj(lm_decode_payload(data, kDecKey), 0);
+        if (t.length) lm_note_hook_token(t);
+    } @catch (NSException *e) {
+    }
+}
+
+typedef NSURLSessionDataTask *(*LMDataTaskCH)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
+typedef NSURLSessionDataTask *(*LMDataTask)(id, SEL, NSURLRequest *);
+
+static NSMutableDictionary *lm_imp_map = nil;
+
+static NSString *lm_imp_key(Class cls, SEL sel) {
+    return [NSString stringWithFormat:@"%s|%s", class_getName(cls), sel_getName(sel)];
+}
+
+static IMP lm_imp_lookup(id self, SEL cmd) {
+    Class cls = object_getClass(self);
+    while (cls) {
+        id v = lm_imp_map[lm_imp_key(cls, cmd)];
+        if (v) return (IMP)[v pointerValue];
+        cls = class_getSuperclass(cls);
+    }
+    return NULL;
+}
+
+static NSURLSessionDataTask *lm_new_dt_ch(id self, SEL _cmd, NSURLRequest *req,
+                                          void (^handler)(NSData *, NSURLResponse *, NSError *)) {
+    IMP orig = lm_imp_lookup(self, _cmd);
+    lm_capture_from_request(req);
+    void (^wrapped)(NSData *, NSURLResponse *, NSError *) = handler;
+    if (handler && !lm_is_internal_request(req)) {
+        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            lm_capture_from_response(data);
+            handler(data, resp, err);
+        };
+    }
+    return orig ? ((LMDataTaskCH)orig)(self, _cmd, req, wrapped) : nil;
+}
+
+static NSURLSessionDataTask *lm_new_dt(id self, SEL _cmd, NSURLRequest *req) {
+    IMP orig = lm_imp_lookup(self, _cmd);
+    lm_capture_from_request(req);
+    return orig ? ((LMDataTask)orig)(self, _cmd, req) : nil;
+}
+
+static void lm_hook_install(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+    if (!lm_imp_map) lm_imp_map = [NSMutableDictionary dictionary];
+    NSArray *classes = @[[NSURLSession class], NSClassFromString(@"__NSCFURLSession") ?: [NSNull null]];
+    SEL sels[2] = {@selector(dataTaskWithRequest:completionHandler:), @selector(dataTaskWithRequest:)};
+    IMP imps[2] = {(IMP)lm_new_dt_ch, (IMP)lm_new_dt};
+    for (id c in classes) {
+        Class cls = [c isKindOfClass:[NSNull class]] ? Nil : (Class)c;
+        if (!cls) continue;
+        for (int i = 0; i < 2; i++) {
+            Method m = class_getInstanceMethod(cls, sels[i]);
+            if (!m) continue;
+            IMP cur = method_getImplementation(m);
+            if (cur == imps[i]) continue;
+            lm_imp_map[lm_imp_key(cls, sels[i])] = [NSValue valueWithPointer:cur];
+            method_setImplementation(m, imps[i]);
+        }
+    }
+    LM_LOG(@"网络登录态 hook 已安装");
+}
+
+#pragma mark - token 获取兜底（文件 / UserDefaults / Keychain）
+
+static BOOL lm_key_tokenish(NSString *k) {
+    NSString *l = [k lowercaseString];
+    return [l containsString:@"token"] || [l containsString:@"auth"] || [l containsString:@"jwt"]
+        || [l containsString:@"session"] || [l containsString:@"login"] || [l containsString:@"user"];
+}
+
+static NSArray<NSString *> *lm_scan_user_defaults(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSDictionary *dict = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
+        @"[A-Za-z0-9%_\\-\\.\\+\\/=]{40,400}" options:0 error:nil];
+    for (NSString *k in dict) {
+        if (!lm_key_tokenish(k)) continue;
+        id v = dict[k];
+        NSString *s = nil;
+        if ([v isKindOfClass:[NSString class]]) s = v;
+        else if ([v isKindOfClass:[NSData class]]) s = [[NSString alloc] initWithData:v encoding:NSISOLatin1StringEncoding];
+        else if ([v isKindOfClass:[NSDictionary class]] || [v isKindOfClass:[NSArray class]]) {
+            NSData *j = [NSJSONSerialization isValidJSONObject:v] ? [NSJSONSerialization dataWithJSONObject:v options:0 error:nil] : nil;
+            if (j) s = [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding];
+        }
+        if (!s.length) continue;
+        for (NSTextCheckingResult *m in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)]) {
+            NSString *cand = [s substringWithRange:m.range];
+            if (![out containsObject:cand]) [out addObject:cand];
+        }
+    }
+    return out;
+}
+
+static NSArray<NSString *> *lm_scan_keychain(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSDictionary *q = @{
+        (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+        (__bridge id)kSecReturnAttributes: @YES,
+        (__bridge id)kSecReturnData: @YES,
+    };
+    CFTypeRef result = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &result);
+    if (st != errSecSuccess || !result) return out;
+    NSArray *items = (__bridge_transfer NSArray *)result;
+    if (![items isKindOfClass:[NSArray class]]) return out;
+    for (id it in items) {
+        if (![it isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *d = (NSDictionary *)it;
+        NSString *acc = d[(__bridge id)kSecAttrAccount] ?: @"";
+        NSString *svc = d[(__bridge id)kSecAttrService] ?: @"";
+        id raw = d[(__bridge id)kSecValueData];
+        NSString *val = nil;
+        if ([raw isKindOfClass:[NSData class]] && [(NSData *)raw length]) {
+            val = [[NSString alloc] initWithData:(NSData *)raw encoding:NSUTF8StringEncoding];
+            if (!val) val = [[NSString alloc] initWithData:(NSData *)raw encoding:NSISOLatin1StringEncoding];
+        } else if ([raw isKindOfClass:[NSString class]]) {
+            val = (NSString *)raw;
+        }
+        val = [val stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (!val.length) continue;
+        BOOL keyHit = lm_key_tokenish(acc) || lm_key_tokenish(svc);
+        BOOL lenHit = val.length >= 40 && val.length <= 400;
+        if (val.length >= 20 && val.length <= 400 && ![val containsString:@" "] && (lenHit || keyHit)) {
+            if (![out containsObject:val]) [out addObject:val];
+        }
+    }
+    return out;
+}
 
 static NSString *lm_read_token_from_files(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -367,9 +590,19 @@ static NSString *lm_read_token_from_files(void) {
         NSString *p = [home stringByAppendingPathComponent:sub];
         if ([fm fileExistsAtPath:p]) [roots addObject:p];
     }
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
-        @"[Tt][Oo][Kk][Ee][Nn][\"']?\\s*[:=]\\s*[\\\\\"']*([A-Za-z0-9%_\\-\\.\\+\\/=]{40,400})"
-        options:0 error:nil];
+    NSArray<NSRegularExpression *> *patterns = @[
+        [NSRegularExpression regularExpressionWithPattern:
+            @"[Tt][Oo][Kk][Ee][Nn][\"']?\\s*[:=]\\s*[\\\\\"']*([A-Za-z0-9%_\\-\\.\\+\\/=]{40,400})"
+            options:0 error:nil],
+        // MMKV / NSUserDefaults 二进制里键名与值是长度字节分隔，不是冒号或等号
+        [NSRegularExpression regularExpressionWithPattern:
+            @"[Tt][Oo][Kk][Ee][Nn][\\x00-\\x20]{0,6}[\"'=:]{0,2}([A-Za-z0-9%_\\-\\.\\+\\/=]{40,400})"
+            options:0 error:nil],
+        // JWT 形态
+        [NSRegularExpression regularExpressionWithPattern:
+            @"(eyJ[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,})"
+            options:0 error:nil],
+    ];
     NSMutableArray<NSString *> *cands = [NSMutableArray array];
     NSInteger scanned = 0;
 
@@ -392,15 +625,28 @@ static NSString *lm_read_token_from_files(void) {
             if (!d || d.length == 0) continue;
             NSString *s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
             if (!s) continue;
-            NSArray *ms = [re matchesInString:s options:0 range:NSMakeRange(0, s.length)];
-            for (NSTextCheckingResult *m in ms) {
-                NSString *v = [s substringWithRange:[m rangeAtIndex:1]];
-                if (v.length >= 40 && ![cands containsObject:v]) [cands addObject:v];
+            for (NSRegularExpression *re in patterns) {
+                NSArray *ms = [re matchesInString:s options:0 range:NSMakeRange(0, s.length)];
+                for (NSTextCheckingResult *m in ms) {
+                    NSString *v = [s substringWithRange:[m rangeAtIndex:1]];
+                    if (v.length >= 40 && v.length <= 400 && ![cands containsObject:v]) [cands addObject:v];
+                }
             }
         }
     }
-    // 候选逐个验活
+    // 追加 UserDefaults / Keychain 里的候选（App 换账号常写这里）
+    [cands addObjectsFromArray:lm_scan_user_defaults()];
+    [cands addObjectsFromArray:lm_scan_keychain()];
+    NSMutableArray<NSString *> *ordered = [NSMutableArray array];
+    for (NSString *c in cands) {
+        if (![ordered containsObject:c]) [ordered addObject:c];
+    }
+    cands = ordered;
+
+    // 候选逐个验活（限量，避免长尾请求拖慢）
+    NSInteger tried = 0;
     for (NSString *cand in cands) {
+        if (++tried > 12) break;
         NSDictionary *r = lm_call(@"/api/user/info", cand, nil, nil);
         NSDictionary *ui = r[@"data"][@"user_info"];
         if ([r[@"code"] intValue] == 200 && [ui isKindOfClass:[NSDictionary class]] && ui[@"user_code"]) {
@@ -457,14 +703,33 @@ static void lm_run_all(void (^status)(NSString *), void (^done)(BOOL, NSString *
             lm_status_text = s ?: @"";
             if (status) dispatch_async(dispatch_get_main_queue(), ^{ status(s); });
         };
-        NSString *token = [[NSUserDefaults standardUserDefaults] stringForKey:@"lm_plus_token"];
-        if (token.length < 20 || ![lm_user_info(token) isKindOfClass:[NSDictionary class]]) {
-            update(@"正在定位登录态…");
-            token = lm_read_token_from_files();
-            if (token.length > 20) [[NSUserDefaults standardUserDefaults] setObject:token forKey:@"lm_plus_token"];
-        }
+        if (!lm_hook_lock) lm_hook_lock = [NSLock new];
+        NSString *token = nil;
+
+        // 1) 优先用 hook 抓到的登录态（App 每个请求都带 token，换账号后会立即刷新）
+        [lm_hook_lock lock];
+        NSString *hooked = [lm_latest_hook_token copy];
+        [lm_hook_lock unlock];
+        if (hooked.length >= 20 && [lm_user_info(hooked) isKindOfClass:[NSDictionary class]]) token = hooked;
+
+        // 2) 上次缓存
         if (token.length < 20) {
-            if (done) dispatch_async(dispatch_get_main_queue(), ^{ done(NO, @"未找到登录态，请先在 App 内登录"); });
+            NSString *cached = [[NSUserDefaults standardUserDefaults] stringForKey:@"lm_plus_token"];
+            if (cached.length >= 20 && [lm_user_info(cached) isKindOfClass:[NSDictionary class]]) token = cached;
+        }
+
+        // 3) 扫沙盒文件 / UserDefaults / Keychain 兜底
+        if (token.length < 20) {
+            update(@"正在定位登录态（可在 App 内点开任意页面再试）…");
+            token = lm_read_token_from_files();
+        }
+
+        if (token.length >= 20) {
+            [[NSUserDefaults standardUserDefaults] setObject:token forKey:@"lm_plus_token"];
+        } else {
+            if (done) dispatch_async(dispatch_get_main_queue(), ^{
+                done(NO, @"未找到登录态：请先在 App 内退出重登并刷新页面，再点一键加积分");
+            });
             return;
         }
 
@@ -707,6 +972,7 @@ static LMOverlay *gOverlay = nil;
 
 __attribute__((constructor)) static void lm_plus_init(void) {
     LM_LOG(@"loaded in %@", [[NSBundle mainBundle] bundleIdentifier]);
+    lm_hook_install();   // 必须在 App 发出首个请求前挂上，第一时间拿到登录态
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         @try {
             [[LMOverlay shared] setup];
