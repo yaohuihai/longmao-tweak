@@ -485,8 +485,32 @@ static void lm_run_all(void (^status)(NSString *), void (^done)(BOOL, NSString *
 
 #pragma mark - 界面
 
+// 点击穿透窗口：只放行悬浮球与面板区域的触摸，其余一律交给下层 App 窗口
+@interface LMPassthroughWindow : UIWindow
+@property (nonatomic, weak) UIView *hitBall;
+@property (nonatomic, weak) UIView *hitPanel;
+@end
+
+@implementation LMPassthroughWindow
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *ball = self.hitBall;
+    UIView *panel = self.hitPanel;
+    if (ball && !ball.hidden && ball.alpha > 0.01 && CGRectContainsPoint(ball.frame, point)) {
+        return [ball hitTest:[ball convertPoint:point fromView:self] withEvent:event] ?: ball;
+    }
+    if (panel && !panel.hidden && panel.alpha > 0.01 && CGRectContainsPoint(panel.frame, point)) {
+        UIView *v = [super hitTest:point withEvent:event];
+        // 命中面板或其子视图才消费，否则穿透
+        if (v && (v == panel || [v isDescendantOfView:panel])) return v;
+    }
+    return nil;   // 透明区域不吃事件，App 正常响应
+}
+
+@end
+
 @interface LMOverlay : NSObject
-@property (nonatomic, strong) UIWindow *window;
+@property (nonatomic, strong) LMPassthroughWindow *window;
 @property (nonatomic, strong) UIButton *ball;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -507,21 +531,25 @@ static LMOverlay *gOverlay = nil;
     return gOverlay;
 }
 
-- (UIWindow *)makeWindow {
-    UIWindow *w = nil;
+- (LMPassthroughWindow *)makeWindow {
+    LMPassthroughWindow *w = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]]) {
-                w = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+                w = [[LMPassthroughWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
                 break;
             }
         }
     }
-    if (!w) w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    if (!w) w = [[LMPassthroughWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    w.frame = [UIScreen mainScreen].bounds;
     w.windowLevel = UIWindowLevelAlert + 20;
     w.backgroundColor = [UIColor clearColor];
     w.rootViewController = [[UIViewController alloc] init];
+    w.rootViewController.view.frame = w.bounds;
     w.rootViewController.view.backgroundColor = [UIColor clearColor];
+    // 关键：根视图本身不吃点击，命中判定全部交给 hitTest
+    w.rootViewController.view.userInteractionEnabled = YES;
     w.hidden = NO;
     return w;
 }
@@ -543,8 +571,10 @@ static LMOverlay *gOverlay = nil;
     [self.ball addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [self.ball addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(dragBall:)]];
     [self.window.rootViewController.view addSubview:self.ball];
+    self.window.hitBall = self.ball;
 
     [self buildPanel];
+    self.window.hitPanel = self.panel;
 
     BOOL autoOn = [[NSUserDefaults standardUserDefaults] boolForKey:@"lm_plus_auto"];
     self.autoSwitch.on = autoOn;
