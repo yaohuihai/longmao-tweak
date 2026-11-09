@@ -1,0 +1,8 @@
+Package: com.longmao.plus
+Name: LongmaoPlus
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: 龙猫工具大师 悬浮球加积分（自注入 dylib）
+Maintainer: local
+Author: local
+Section: Tweaks
