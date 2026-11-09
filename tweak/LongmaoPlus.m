@@ -164,9 +164,8 @@ static void mp_value(NSMutableData *d, id v) {
     } else if ([v isKindOfClass:[NSString class]]) {
         mp_str(d, v);
     } else if ([v isKindOfClass:[NSNumber class]]) {
-        const char *t = [(NSNumber *)v objCType];
-        if (t && strcmp(t, @encode(BOOL)) == 0) {
-            mp_u8(d, [(NSNumber *)v boolValue] ? 0xC3 : 0xC2);
+        if (CFGetTypeID((__bridge CFTypeRef)v) == CFBooleanGetTypeID()) {
+            mp_u8(d, [(NSNumber *)v boolValue] ? 0xC3 : 0xC2);   // 必须编码成 msgpack bool
         } else {
             mp_int(d, [(NSNumber *)v longLongValue]);
         }
@@ -369,7 +368,7 @@ static NSString *lm_read_token_from_files(void) {
         if ([fm fileExistsAtPath:p]) [roots addObject:p];
     }
     NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
-        @"[Tt][Oo][Kk][Ee][Nn][\"']?\\s*[:=]\\s*[\"']?([A-Za-z0-9%_\\-\\.\\+\\/=]{40,400})"
+        @"[Tt][Oo][Kk][Ee][Nn][\"']?\\s*[:=]\\s*[\\\\\"']*([A-Za-z0-9%_\\-\\.\\+\\/=]{40,400})"
         options:0 error:nil];
     NSMutableArray<NSString *> *cands = [NSMutableArray array];
     NSInteger scanned = 0;
