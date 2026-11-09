@@ -5,39 +5,43 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Theos
+      - name: Install clang + lld
         run: |
-          set -e
-          SDKPATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          SDKVER=$(xcrun --sdk iphoneos --show-sdk-version)
-          echo "SDK $SDKVER -> $SDKPATH"
-          sudo git clone --recursive --depth 1 https://github.com/theos/theos.git /opt/theos
-          sudo mkdir -p /opt/theos/sdks
-          sudo ln -sfn "$SDKPATH" "/opt/theos/sdks/iPhoneOS${SDKVER}.sdk"
-          sudo chown -R "$(whoami)" /opt/theos
-          echo "THEOS=/opt/theos" >> "$GITHUB_ENV"
-          ls -l /opt/theos/sdks
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld git file
+          clang --version | head -2
+          ls -l /usr/bin/ld64.lld /usr/bin/ld.lld 2>/dev/null || true
 
-      - name: Install ldid
-        run: brew install ldid || true
-
-      - name: Build dylib
+      - name: Fetch iPhoneOS SDK
         run: |
-          set -e
+          git clone --filter=blob:none --sparse https://github.com/theos/sdks.git sdks
+          cd sdks
+          git sparse-checkout set iPhoneOS16.5.sdk
+          echo "SDK=$PWD/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
+          du -sh iPhoneOS16.5.sdk
+          ls iPhoneOS16.5.sdk/usr/lib/libSystem.tbd
+
+      - name: Compile dylib
+        run: |
+          set -x
           cd tweak
-          make clean || true
-          make -j4 2>&1 | tail -80
-          echo "---- artifacts ----"
-          find . -name '*.dylib' -exec ls -lh {} \;
+          clang -target arm64-apple-ios15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -fblocks -O2 -dynamiclib \
+            -fuse-ld=/usr/bin/ld64.lld \
+            -framework Foundation -framework UIKit \
+            -Wl,-install_name,@executable_path/LongmaoPlus.dylib \
+            -o LongmaoPlus.dylib LongmaoPlus.m
+          file LongmaoPlus.dylib
+          ls -lh LongmaoPlus.dylib
 
       - uses: actions/upload-artifact@v4
         with:
           name: LongmaoPlus_dylib
-          path: tweak/.theos/obj/**/*.dylib
+          path: tweak/LongmaoPlus.dylib
           if-no-files-found: error
-          retention-days: 14
