@@ -31,18 +31,14 @@ jobs:
         run: |
           set -eux
           cd tweak
-          clang -target arm64-apple-ios15.0 \
-            -isysroot "$SDK" \
-            -fobjc-arc -fblocks -O2 -dynamiclib \
-            -fuse-ld=lld \
-            -framework Foundation -framework UIKit -framework CoreGraphics \
-            -Wl,-install_name,@executable_path/LongmaoPlus.dylib \
-            -o LongmaoPlus.dylib LongmaoPlus.m
-          file LongmaoPlus.dylib
-          ls -lh LongmaoPlus.dylib
+          FLAGS="-target arm64-apple-ios15.0 -isysroot $SDK -fobjc-arc -fblocks -O2 -dynamiclib -fuse-ld=lld -framework Foundation -framework UIKit -framework CoreGraphics"
+          clang $FLAGS -Wl,-install_name,@executable_path/LongmaoPlus.dylib -o LongmaoPlus.dylib LongmaoPlus.m
+          clang $FLAGS -Wl,-install_name,@executable_path/Frameworks/LongmaoPlus.dylib -o LongmaoPlus_Frameworks.dylib LongmaoPlus.m
+          file LongmaoPlus.dylib LongmaoPlus_Frameworks.dylib
+          ls -lh *.dylib
 
       - uses: actions/upload-artifact@v4
         with:
           name: LongmaoPlus_dylib
-          path: tweak/LongmaoPlus.dylib
+          path: tweak/*.dylib
           if-no-files-found: error
