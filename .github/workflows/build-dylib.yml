@@ -15,7 +15,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang lld git file
           clang --version | head -2
-          ls -l /usr/bin/ld64.lld /usr/bin/ld.lld 2>/dev/null || true
+          ls -l /usr/bin/ld.lld* || true
+          sudo ln -sf "$(readlink -f /usr/bin/ld.lld)" /usr/bin/ld64.lld
+          ld64.lld --version || true
 
       - name: Fetch iPhoneOS SDK
         run: |
@@ -24,16 +26,15 @@ jobs:
           git sparse-checkout set iPhoneOS16.5.sdk
           echo "SDK=$PWD/iPhoneOS16.5.sdk" >> "$GITHUB_ENV"
           du -sh iPhoneOS16.5.sdk
-          ls iPhoneOS16.5.sdk/usr/lib/libSystem.tbd
 
       - name: Compile dylib
         run: |
-          set -x
+          set -eux
           cd tweak
           clang -target arm64-apple-ios15.0 \
             -isysroot "$SDK" \
             -fobjc-arc -fblocks -O2 -dynamiclib \
-            -fuse-ld=/usr/bin/ld64.lld \
+            -fuse-ld=lld \
             -framework Foundation -framework UIKit \
             -Wl,-install_name,@executable_path/LongmaoPlus.dylib \
             -o LongmaoPlus.dylib LongmaoPlus.m
