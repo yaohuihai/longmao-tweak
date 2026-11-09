@@ -672,6 +672,8 @@ static NSInteger lm_credits(NSString *token) {
 }
 
 // 单类任务补齐；progress 回调次数
+static NSMutableArray *lm_task_notes = nil;   // 本次执行各类任务的结果明细
+
 static NSInteger lm_run_task(NSString *token, NSString *infoPath, NSString *activePath,
                              NSString *name, void (^progress)(NSString *)) {
     NSDictionary *r = lm_call(infoPath, token, nil, nil);
@@ -680,8 +682,15 @@ static NSInteger lm_run_task(NSString *token, NSString *infoPath, NSString *acti
     NSInteger total = [ti[@"total_count"] integerValue];
     if (total <= 0) total = 10;
     if (progress) progress([NSString stringWithFormat:@"%@ %ld/%ld", name, (long)done, (long)total]);
+    if (!lm_task_notes) lm_task_notes = [NSMutableArray array];
+
+    if (done >= total) {
+        [lm_task_notes addObject:[NSString stringWithFormat:@"%@ 今日已领完 %ld/%ld", name, (long)done, (long)total]];
+        return 0;
+    }
 
     NSInteger ok = 0;
+    NSString *lastErr = nil;
     for (NSInteger i = done; i < total; i++) {
         NSDictionary *rr = lm_call(activePath, token, nil, nil);
         NSInteger code = [rr[@"code"] integerValue];
@@ -689,11 +698,13 @@ static NSInteger lm_run_task(NSString *token, NSString *infoPath, NSString *acti
             ok++;
             if (progress) progress([NSString stringWithFormat:@"%@ %ld/%ld", name, (long)(i + 1), (long)total]);
         } else {
+            lastErr = [NSString stringWithFormat:@"%@", rr[@"msg"] ?: @(code)];
             LM_LOG(@"%@ 中断：%@", name, rr[@"msg"] ?: rr);
             if (code == 100 || code == 1001 || code == 1020) break;
         }
         [NSThread sleepForTimeInterval:1.2];
     }
+    if (lastErr) [lm_task_notes addObject:[NSString stringWithFormat:@"%@ 失败 %ld 次：%@", name, (long)(total - done - ok), lastErr]];
     return ok;
 }
 
@@ -733,16 +744,21 @@ static void lm_run_all(void (^status)(NSString *), void (^done)(BOOL, NSString *
             return;
         }
 
+        lm_task_notes = [NSMutableArray array];
         NSInteger before = lm_credits(token);
         update([NSString stringWithFormat:@"当前积分 %ld，签到中…", (long)before]);
         NSDictionary *sign = lm_call(@"/api/task/sign/daily/active", token, nil, nil);
-        LM_LOG(@"签到：%@", sign[@"msg"] ?: @( [sign[@"code"] integerValue] ));
+        NSInteger signCode = [sign[@"code"] integerValue];
+        LM_LOG(@"签到：%@", sign[@"msg"] ?: @(signCode));
+        [lm_task_notes addObject:[NSString stringWithFormat:@"签到%@",
+                                  signCode == 200 ? @"成功" : [NSString stringWithFormat:@"：%@", sign[@"msg"] ?: @(signCode)]]];
 
         lm_run_task(token, @"/api/task/watchvideo/info", @"/api/task/watchvideo/active", @"看视频", update);
         lm_run_task(token, @"/api/task/watchbanner/info", @"/api/task/watchbanner/active", @"看Banner", update);
 
         NSInteger after = lm_credits(token);
-        NSString *msg = [NSString stringWithFormat:@"完成：%ld → %ld（+%ld）", (long)before, (long)after, (long)(after - before)];
+        NSString *detail = [lm_task_notes componentsJoinedByString:@"；"];
+        NSString *msg = [NSString stringWithFormat:@"完成：%ld → %ld（+%ld）\n%@", (long)before, (long)after, (long)(after - before), detail];
         update(msg);
         if (done) dispatch_async(dispatch_get_main_queue(), ^{ done(YES, msg); });
     });
@@ -761,14 +777,21 @@ static void lm_run_all(void (^status)(NSString *), void (^done)(BOOL, NSString *
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *ball = self.hitBall;
     UIView *panel = self.hitPanel;
+    UIView *root = self.rootViewController.view;
+    UIView *hit = [super hitTest:point withEvent:event];
+
+    // 1) 悬浮球区域
     if (ball && !ball.hidden && ball.alpha > 0.01 && CGRectContainsPoint(ball.frame, point)) {
         return [ball hitTest:[ball convertPoint:point fromView:self] withEvent:event] ?: ball;
     }
+    // 2) 面板区域：命中面板或其子视图才消费，否则穿透
     if (panel && !panel.hidden && panel.alpha > 0.01 && CGRectContainsPoint(panel.frame, point)) {
-        UIView *v = [super hitTest:point withEvent:event];
-        // 命中面板或其子视图才消费，否则穿透
-        if (v && (v == panel || [v isDescendantOfView:panel])) return v;
+        if (hit && (hit == panel || [hit isDescendantOfView:panel])) return hit;
     }
+    // 3) 弹窗层（UIAlertController 等）：除窗口自身与透明根容器外一律放行，
+    //    否则弹窗上的“好”按钮点不到（事件被下发给 App 窗口）
+    if (hit && hit != self && hit != root) return hit;
+
     return nil;   // 透明区域不吃事件，App 正常响应
 }
 
@@ -962,7 +985,10 @@ static LMOverlay *gOverlay = nil;
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:ok ? @"加积分完成" : @"加积分未完成"
                                                                   message:msg preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self2.window.rootViewController presentViewController:ac animated:YES completion:nil];
+        UIViewController *host = self2.window.rootViewController;
+        if (!host) return;
+        if (host.presentedViewController) [host dismissViewControllerAnimated:NO completion:nil];
+        [host presentViewController:ac animated:YES completion:nil];
     });
 }
 
