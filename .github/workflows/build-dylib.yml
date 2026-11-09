@@ -31,7 +31,7 @@ jobs:
         run: |
           set -eux
           cd tweak
-          FLAGS="-target arm64-apple-ios15.0 -isysroot $SDK -fobjc-arc -fblocks -O2 -dynamiclib -fuse-ld=lld -framework Foundation -framework UIKit -framework CoreGraphics"
+          FLAGS="-target arm64-apple-ios15.0 -isysroot $SDK -fobjc-arc -fblocks -O2 -dynamiclib -fuse-ld=lld -framework Foundation -framework UIKit -framework CoreGraphics -framework Security"
           clang $FLAGS -Wl,-install_name,@executable_path/LongmaoPlus.dylib -o LongmaoPlus.dylib LongmaoPlus.m
           clang $FLAGS -Wl,-install_name,@executable_path/Frameworks/LongmaoPlus.dylib -o LongmaoPlus_Frameworks.dylib LongmaoPlus.m
           file LongmaoPlus.dylib LongmaoPlus_Frameworks.dylib
